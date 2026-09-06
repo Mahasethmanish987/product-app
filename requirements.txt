@@ -1,0 +1,4 @@
+# Runtime dependencies -- these go into the Docker image.
+# Pinned so every install (laptop, CI, production) is identical.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
