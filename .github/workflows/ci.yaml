@@ -1,42 +1,28 @@
-# ─────────────────────────────────────────────────────────────
-# MODULE 1: the simplest useful CI pipeline.
-# Checks out the code, installs deps, lints, and runs tests.
-# ─────────────────────────────────────────────────────────────
+name: Ci 
 
-name: CI                          # shown in the Actions tab and on PR checks
-
-on:                               # WHEN does this run? (the "trigger")
+on:
   push:
-    branches: [main]              #   every push to main
-  pull_request:                   #   and every pull request, any branch
+    branches: [main]
+  pull_request:
+    branches: [main]  
 
-jobs:                             # WHAT runs. Jobs run in parallel by default.
-  test:                           # <- job ID (you choose it; used by `needs:`)
-    name: Lint & Test             #    friendly name shown in the UI
-    runs-on: ubuntu-latest        #    the RUNNER: a fresh Ubuntu VM, empty
-
-    steps:                        # steps run IN ORDER, on that one VM
-      - name: Check out the code
-        uses: actions/checkout@v4
-        # `uses:` runs a reusable Action from the marketplace.
-        # Without this, the VM has NO copy of your repo at all.
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"  # must match the Dockerfile: python:3.13-slim
-        # `with:` passes inputs to the Action, like function arguments.
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-        # `run:` executes a shell command. The `|` allows multiple lines.
-
-      - name: Lint with ruff
-        run: ruff check .
-        # Cheapest gate first: fails in ~2s, before we waste time on tests.
-
-      - name: Run tests
-        run: pytest
-        # Exit code 0 = green. Anything else = this job fails.
+jobs:
+  build:
+    runs-on: ubuntu-latest 
+    steps:
+     - name: Checkout code 
+       uses: actions/checkout@v4
+     - name: setup python 
+       uses: actions/setup-python@v4 
+       with:
+         python-version: 3.13
+     - name: Install Dependencies
+       run: |
+         python -m pip install --upgrade pip 
+         python -m pip install -r requirements-dev.txt 
+     - name: Check ruff 
+       run: |
+         ruff check . 
+     - name: Run tests
+       run: |
+         pytest tests/     
