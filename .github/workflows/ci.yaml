@@ -1,28 +1,80 @@
-name: Ci 
+name: UAT promotion gate sdf
 
 on:
-  push:
-    branches: [main]
   pull_request:
-    branches: [main]  
+    branches: [uat]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest 
+  require-merged-into-main:
+    name: Feature must be merged into main first
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      HEAD_REF: ${{ github.head_ref }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
     steps:
-     - name: Checkout code 
-       uses: actions/checkout@v4
-     - name: setup python 
-       uses: actions/setup-python@v4 
-       with:
-         python-version: 3.13
-     - name: Install Dependencies
-       run: |
-         python -m pip install --upgrade pip 
-         python -m pip install -r requirements-dev.txt 
-     - name: Check ruff 
-       run: |
-         ruff check . 
-     - name: Run tests
-       run: |
-         pytest tests/     
+      - name: Branch name must be a feature branch
+        run: |
+          case "$HEAD_REF" in
+            feat/*|fix/*|hotfix/*)
+              echo "Branch OK: $HEAD_REF"
+              ;;
+            *)
+              echo "::error::Use feat/, fix/ or hotfix/ branches"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check A - is this commit already in main?
+        id: ancestry
+        run: |
+          git fetch --no-tags origin main
+          if git merge-base --is-ancestor "$HEAD_SHA" FETCH_HEAD
+          then
+            echo "result=contained" >> "$GITHUB_OUTPUT"
+            echo "Found in main."
+          else
+            echo "result=missing" >> "$GITHUB_OUTPUT"
+            echo "Not found - checking GitHub records."
+          fi
+
+      - name: Check B - was a PR from this branch merged to main?
+        if: steps.ancestry.outputs.result == 'missing'
+        run: |
+          OWNER="${REPO%%/*}"
+
+          Q="state=closed&base=main"
+          Q="$Q&head=$OWNER:$HEAD_REF&per_page=100"
+
+          F='[.[] | select(.merged_at != null)]'
+          F="$F | sort_by(.merged_at) | last"
+          F="$F | .head.sha // empty"
+
+          MERGED=$(gh api "repos/$REPO/pulls?$Q" --jq "$F")
+
+          if [ -z "$MERGED" ]; then
+            echo "::error::$HEAD_REF is not merged into main yet."
+            echo "::error::Merge it into main, then open this PR."
+            exit 1
+          fi
+
+          if [ "$MERGED" != "$HEAD_SHA" ]; then
+            echo "::error::main has $MERGED but this PR is $HEAD_SHA."
+            echo "::error::Send the newer commits through main first."
+            exit 1
+          fi
+
+          echo "Verified: merged into main at $MERGED."
