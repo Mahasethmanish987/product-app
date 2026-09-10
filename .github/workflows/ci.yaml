@@ -1,4 +1,4 @@
-name: UAT promotion gate 
+name: ci 
 
 on:
   pull_request:
