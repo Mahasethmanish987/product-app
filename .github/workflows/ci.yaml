@@ -14,17 +14,21 @@ jobs:
     name: Feature must be merged into dev first
     runs-on: ubuntu-latest
 
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      HEAD_REF: ${{ github.head_ref }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
     steps:
-      - name: Source branch must be a feature branch
-        env:
-          BR: ${{ github.head_ref }}
+      - name: Branch name must be a feature branch
         run: |
-          case "$BR" in
+          case "$HEAD_REF" in
             feat/*|fix/*|hotfix/*)
-              echo "Source branch OK: $BR"
+              echo "Branch OK: $HEAD_REF"
               ;;
             *)
-              echo "::error::PRs into uat must come from feat/*, fix/* or hotfix/* (got '$BR')"
+              echo "::error::Use feat/, fix/ or hotfix/ branches"
               exit 1
               ;;
           esac
@@ -34,39 +38,43 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check A - is this commit already inside dev?
+      - name: Check A - is this commit already in dev?
         id: ancestry
         run: |
-          git fetch --no-tags origin dev:refs/remotes/origin/dev
-          if git merge-base --is-ancestor "${{ github.event.pull_request.hea
+          git fetch --no-tags origin dev
+          if git merge-base --is-ancestor "$HEAD_SHA" FETCH_HEAD
+          then
             echo "result=contained" >> "$GITHUB_OUTPUT"
-            echo "Commit is an ancestor of dev."
+            echo "Found in dev."
           else
             echo "result=missing" >> "$GITHUB_OUTPUT"
-            echo "Not an ancestor of dev - checking GitHub merge records (squash/rebase)."
+            echo "Not found - checking GitHub records."
           fi
 
-      - name: Check B - did a PR from this branch merge into dev?
+      - name: Check B - was a PR from this branch merged to dev?
         if: steps.ancestry.outputs.result == 'missing'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          HEAD_REF: ${{ github.head_ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           OWNER="${REPO%%/*}"
-          MERGED_SHA=$(gh api \
-            "repos/$REPO/pulls?state=closed&base=dev&head=$OWNER:$HEAD_REF&p
-            --jq '[.[] | select(.merged_at != null)] | sort_by(.merged_at) | last | .head.sha // empty')
 
-          if [ -z "$MERGED_SHA" ]; then
-            echo "::error::Branch '$HEAD_REF' has not been merged into dev ythen open this PR."
+          Q="state=closed&base=dev"
+          Q="$Q&head=$OWNER:$HEAD_REF&per_page=100"
+
+          F='[.[] | select(.merged_at != null)]'
+          F="$F | sort_by(.merged_at) | last"
+          F="$F | .head.sha // empty"
+
+          MERGED=$(gh api "repos/$REPO/pulls?$Q" --jq "$F")
+
+          if [ -z "$MERGED" ]; then
+            echo "::error::$HEAD_REF is not merged into dev yet."
+            echo "::error::Merge it into dev, then open this PR."
             exit 1
           fi
 
-          if [ "$MERGED_SHA" != "$HEAD_SHA" ]; then
-            echo "::error::Branch '$HEAD_REF' was merged into dev at $MERGED_SHA, but this PR is at $HEAD_SHA. New commits were pushed after the dev merge - send them through dev first."
+          if [ "$MERGED" != "$HEAD_SHA" ]; then
+            echo "::error::dev has $MERGED but this PR is $HEAD_SHA."
+            echo "::error::Send the newer commits through dev first."
             exit 1
           fi
 
-          echo "Verified: '$HEAD_REF' was merged into dev at $MERGED_SHA."
+          echo "Verified: merged into dev at $MERGED."
