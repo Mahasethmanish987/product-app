@@ -1,4 +1,4 @@
-name: UAT promotion gate sdfksdjfkl
+name: UAT promotion gate 
 
 on:
   pull_request:
