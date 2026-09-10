@@ -1,28 +1,72 @@
-name: Ci 
+name: UAT promotion gate
 
 on:
-  push:
-    branches: [main]
   pull_request:
-    branches: [main]  
+    branches: [uat]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest 
+  require-merged-into-dev:
+    name: Feature must be merged into dev first
+    runs-on: ubuntu-latest
+
     steps:
-     - name: Checkout code 
-       uses: actions/checkout@v4
-     - name: setup python 
-       uses: actions/setup-python@v4 
-       with:
-         python-version: 3.13
-     - name: Install Dependencies
-       run: |
-         python -m pip install --upgrade pip 
-         python -m pip install -r requirements-dev.txt 
-     - name: Check ruff 
-       run: |
-         ruff check . 
-     - name: Run tests
-       run: |
-         pytest tests/     
+      - name: Source branch must be a feature branch
+        env:
+          BR: ${{ github.head_ref }}
+        run: |
+          case "$BR" in
+            feat/*|fix/*|hotfix/*)
+              echo "Source branch OK: $BR"
+              ;;
+            *)
+              echo "::error::PRs into uat must come from feat/*, fix/* or hotfix/* (got '$BR')"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check A - is this commit already inside dev?
+        id: ancestry
+        run: |
+          git fetch --no-tags origin dev:refs/remotes/origin/dev
+          if git merge-base --is-ancestor "${{ github.event.pull_request.hea
+            echo "result=contained" >> "$GITHUB_OUTPUT"
+            echo "Commit is an ancestor of dev."
+          else
+            echo "result=missing" >> "$GITHUB_OUTPUT"
+            echo "Not an ancestor of dev - checking GitHub merge records (squash/rebase)."
+          fi
+
+      - name: Check B - did a PR from this branch merge into dev?
+        if: steps.ancestry.outputs.result == 'missing'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          OWNER="${REPO%%/*}"
+          MERGED_SHA=$(gh api \
+            "repos/$REPO/pulls?state=closed&base=dev&head=$OWNER:$HEAD_REF&p
+            --jq '[.[] | select(.merged_at != null)] | sort_by(.merged_at) | last | .head.sha // empty')
+
+          if [ -z "$MERGED_SHA" ]; then
+            echo "::error::Branch '$HEAD_REF' has not been merged into dev ythen open this PR."
+            exit 1
+          fi
+
+          if [ "$MERGED_SHA" != "$HEAD_SHA" ]; then
+            echo "::error::Branch '$HEAD_REF' was merged into dev at $MERGED_SHA, but this PR is at $HEAD_SHA. New commits were pushed after the dev merge - send them through dev first."
+            exit 1
+          fi
+
+          echo "Verified: '$HEAD_REF' was merged into dev at $MERGED_SHA."
