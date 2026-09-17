@@ -10,25 +10,20 @@ permissions:
   pull-requests: read
 
 jobs:
-  require-merged-into-main:
-    name: Feature must be merged into main first
+  require-merged-into-dev:
+    name: Feature must be merged into dev first
     runs-on: ubuntu-latest
 
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      REPO: ${{ github.repository }}
-      HEAD_REF: ${{ github.head_ref }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-
     steps:
-      - name: Branch name must be a feature branch
+      - name: Branch name must be an allowed branch
         run: |
-          case "$HEAD_REF" in
-            feat/*|fix/*|hotfix/*)
-              echo "Branch OK: $HEAD_REF"
+          case "${{ github.head_ref }}" in
+            feat/*|fix/*|bug/*|hotfix/*|refactor/*|chore/*)
+              echo "Branch OK: ${{ github.head_ref }}"
               ;;
             *)
-              echo "::error::Use feat/, fix/ or hotfix/ branches"
+              echo "::error::Branch '${{ github.head_ref }}' is not allowed."
+              echo "::error::Use feat/, fix/, bug/, hotfix/, refactor/ or chore/ branches."
               exit 1
               ;;
           esac
@@ -38,43 +33,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check A - is this commit already in main?
-        id: ancestry
+      - name: Check A - commit must already exist in dev
         run: |
-          git fetch --no-tags origin main
-          if git merge-base --is-ancestor "$HEAD_SHA" FETCH_HEAD
+          git fetch --no-tags origin dev
+
+          if git merge-base --is-ancestor "${{ github.event.pull_request.head.sha }}" FETCH_HEAD
           then
-            echo "result=contained" >> "$GITHUB_OUTPUT"
-            echo "Found in main."
+            echo "Commit ${{ github.event.pull_request.head.sha }} is already in dev."
           else
-            echo "result=missing" >> "$GITHUB_OUTPUT"
-            echo "Not found - checking GitHub records."
-          fi
-
-      - name: Check B - was a PR from this branch merged to main?
-        if: steps.ancestry.outputs.result == 'missing'
-        run: |
-          OWNER="${REPO%%/*}"
-
-          Q="state=closed&base=main"
-          Q="$Q&head=$OWNER:$HEAD_REF&per_page=100"
-
-          F='[.[] | select(.merged_at != null)]'
-          F="$F | sort_by(.merged_at) | last"
-          F="$F | .head.sha // empty"
-
-          MERGED=$(gh api "repos/$REPO/pulls?$Q" --jq "$F")
-
-          if [ -z "$MERGED" ]; then
-            echo "::error::$HEAD_REF is not merged into main yet."
-            echo "::error::Merge it into main, then open this PR."
+            echo "::error::Commit ${{ github.event.pull_request.head.sha }} is NOT in dev."
+            echo "::error::This PR cannot be promoted to UAT until it is merged into dev."
             exit 1
           fi
-
-          if [ "$MERGED" != "$HEAD_SHA" ]; then
-            echo "::error::main has $MERGED but this PR is $HEAD_SHA."
-            echo "::error::Send the newer commits through main first."
-            exit 1
-          fi
-
-          echo "Verified: merged into main at $MERGED."
