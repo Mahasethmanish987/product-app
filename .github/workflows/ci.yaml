@@ -116,17 +116,43 @@ jobs:
     needs: publish
 
     steps:
+      - name: Check the SSH secrets exist
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          missing=""
+          [ -z "$SERVER_HOST" ]    && missing="$missing SERVER_HOST"
+          [ -z "$SERVER_USER" ]    && missing="$missing SERVER_USER"
+          [ -z "$SERVER_SSH_KEY" ] && missing="$missing SERVER_SSH_KEY"
+
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing"
+            echo "::error::Settings -> Secrets and variables -> Actions -> New repository secret"
+            exit 1
+          fi
+
+          case "$SERVER_SSH_KEY" in
+            *"PRIVATE KEY"*) ;;
+            *)
+              echo "::error::SERVER_SSH_KEY does not look like a private key."
+              echo "::error::Paste the whole file including the BEGIN/END lines - not the .pub."
+              exit 1
+              ;;
+          esac
+
       - name: SSH in and roll out the new tag
         uses: appleboy/ssh-action@v1
         env:
           IMAGE_TAG: ${{ needs.publish.outputs.tag }}
+          GIT_SHA: ${{ github.sha }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT || 22 }}
-          envs: IMAGE_TAG,GITHUB_SHA
-          script_stop: true
+          envs: IMAGE_TAG,GIT_SHA
           script: |
             set -euo pipefail
 
@@ -168,7 +194,7 @@ jobs:
             helm upgrade --install "$RELEASE" "$CHART_DIR" \
               --namespace "$NAMESPACE" \
               --set image.tag="$IMAGE_TAG" \
-              --set gitCommit="$GITHUB_SHA" \
+              --set gitCommit="$GIT_SHA" \
               --wait --timeout 5m
 
             kubectl -n "$NAMESPACE" rollout status "deploy/$RELEASE" --timeout=2m
