@@ -29,7 +29,7 @@ def create_category(body: CategoryCreate):
     return category
 
 
-@router.get("/{category_id}", response_model=Category, summary="Get one category")
+@router.get("/{category_ids}", response_model=Category, summary="Get one category")
 def get_category(category_id: ResourceId):
     return store.get_category(category_id)
 
