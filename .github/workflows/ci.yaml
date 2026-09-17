@@ -156,25 +156,16 @@ jobs:
           script: |
             set -euo pipefail
 
-            # Where the deployments repo is cloned on the server.
-            DEPLOY_REPO="${DEPLOY_REPO:-$HOME/traeffic-setup}"
+            # Where the deployments repo lives on the bastion.
+            DEPLOY_REPO="${DEPLOY_REPO:-$HOME/deployments}"
             RELEASE="product-service"
             NAMESPACE="default"
 
-            if [ ! -d "$DEPLOY_REPO" ]; then
-              echo "::error::No deployments repo at $DEPLOY_REPO - clone it there or set DEPLOY_REPO."
-              exit 1
-            fi
-
-            # Pick up any chart changes that were pushed alongside the app.
-            git -C "$DEPLOY_REPO" pull --ff-only || \
-              echo "WARNING: could not fast-forward $DEPLOY_REPO, using the checkout as is"
-
-            # The charts moved under deployments/; accept either layout.
+            # Accept either layout: charts at the repo root, or under deployments/.
             CHART_DIR=""
             for candidate in \
-              "$DEPLOY_REPO/deployments/charts/product-service" \
-              "$DEPLOY_REPO/charts/product-service"
+              "$DEPLOY_REPO/charts/product-service" \
+              "$DEPLOY_REPO/deployments/charts/product-service"
             do
               if [ -d "$candidate" ]; then
                 CHART_DIR="$candidate"
@@ -188,6 +179,14 @@ jobs:
             fi
 
             echo "Using chart at $CHART_DIR"
+
+            # Deploying only changes the image tag; the chart on the server is
+            # left exactly as it is. Set PULL_CHART=true here once the chart in
+            # git matches what the bastion is running.
+            if [ "${PULL_CHART:-false}" = "true" ]; then
+              git -C "$DEPLOY_REPO" pull --ff-only || \
+                echo "WARNING: could not fast-forward $DEPLOY_REPO, using the checkout as is"
+            fi
 
             echo "Upgrading $RELEASE to $IMAGE_TAG"
 
