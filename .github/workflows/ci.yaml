@@ -1,8 +1,4 @@
-name: CI/CD
-
-# Pull requests: lint + tests only.
-# Push to main: build the image, push it to Docker Hub, then SSH into the
-# server and roll the new tag out with `helm upgrade`.
+name: UAT promotion gate
 
 on:
   pull_request:
@@ -49,7 +45,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - name: Checkout with full history
+        uses: actions/checkout@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
