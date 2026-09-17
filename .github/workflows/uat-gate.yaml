@@ -1,0 +1,47 @@
+name: UAT promotion gate
+
+on:
+  pull_request:
+    branches: [uat]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  require-merged-into-dev:
+    name: Feature must be merged into dev first
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Branch name must be an allowed branch
+        run: |
+          case "${{ github.head_ref }}" in
+            feat/*|fix/*|bug/*|hotfix/*|refactor/*|chore/*)
+              echo "Branch OK: ${{ github.head_ref }}"
+              ;;
+            *)
+              echo "::error::Branch '${{ github.head_ref }}' is not allowed."
+              echo "::error::Use feat/, fix/, bug/, hotfix/, refactor/ or chore/ branches."
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout with full history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check A - commit must already exist in dev
+        run: |
+          git fetch --no-tags origin dev
+
+          if git merge-base --is-ancestor "${{ github.event.pull_request.head.sha }}" FETCH_HEAD
+          then
+            echo "Commit ${{ github.event.pull_request.head.sha }} is already in dev."
+          else
+            echo "::error::Commit ${{ github.event.pull_request.head.sha }} is NOT in dev."
+            echo "::error::This PR cannot be promoted to UAT until it is merged into dev."
+            exit 1
+          fi

@@ -1,47 +1,178 @@
-name: UAT promotion gate
+name: CI/CD
+
+# Pull requests: lint + tests only.
+# Push to main: build the image, push it to Docker Hub, then SSH into the
+# server and roll the new tag out with `helm upgrade`.
 
 on:
   pull_request:
-    branches: [uat]
-    types: [opened, synchronize, reopened]
+    branches: [dev, uat, main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
-  pull-requests: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  IMAGE: manish9817680/product-service
 
 jobs:
-  require-merged-into-dev:
-    name: Feature must be merged into dev first
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
 
     steps:
-      - name: Branch name must be an allowed branch
-        run: |
-          case "${{ github.head_ref }}" in
-            feat/*|fix/*|bug/*|hotfix/*|refactor/*|chore/*)
-              echo "Branch OK: ${{ github.head_ref }}"
-              ;;
-            *)
-              echo "::error::Branch '${{ github.head_ref }}' is not allowed."
-              echo "::error::Use feat/, fix/, bug/, hotfix/, refactor/ or chore/ branches."
-              exit 1
-              ;;
-          esac
+      - uses: actions/checkout@v5
 
-      - name: Checkout with full history
-        uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
         with:
-          fetch-depth: 0
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
 
-      - name: Check A - commit must already exist in dev
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff check
+        run: ruff check --output-format github .
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: pytest
+        run: pytest -q
+
+  publish:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name != 'pull_request'
+
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Work out the image tag
+        id: tag
+        run: echo "tag=sha-$(echo "$GITHUB_SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Build the image
         run: |
-          git fetch --no-tags origin dev
+          docker build \
+            --build-arg SERVICE_VERSION=${{ steps.tag.outputs.tag }} \
+            --build-arg GIT_COMMIT="$GITHUB_SHA" \
+            -t "$IMAGE:${{ steps.tag.outputs.tag }}" \
+            -t "$IMAGE:latest" \
+            .
 
-          if git merge-base --is-ancestor "${{ github.event.pull_request.head.sha }}" FETCH_HEAD
-          then
-            echo "Commit ${{ github.event.pull_request.head.sha }} is already in dev."
-          else
-            echo "::error::Commit ${{ github.event.pull_request.head.sha }} is NOT in dev."
-            echo "::error::This PR cannot be promoted to UAT until it is merged into dev."
-            exit 1
-          fi
+      - name: Smoke test the image before it leaves the runner
+        run: |
+          docker run -d --name smoke -p 8000:8000 "$IMAGE:${{ steps.tag.outputs.tag }}"
+
+          for _ in $(seq 30); do
+            curl -sf localhost:8000/health >/dev/null && break
+            sleep 1
+          done
+
+          curl -sf localhost:8000/health   | grep -q '"healthy"'
+          curl -sf localhost:8000/ready    | grep -q '"ready"'
+          curl -sf localhost:8000/version  | grep -q "$GITHUB_SHA"
+          curl -sf localhost:8000/products | grep -q '"items"'
+
+          docker rm -f smoke
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push the image
+        run: |
+          docker push "$IMAGE:${{ steps.tag.outputs.tag }}"
+          docker push "$IMAGE:latest"
+
+  deploy:
+    name: Helm upgrade on the server
+    runs-on: ubuntu-latest
+    needs: publish
+
+    steps:
+      - name: SSH in and roll out the new tag
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: ${{ needs.publish.outputs.tag }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          envs: IMAGE_TAG,GITHUB_SHA
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            # Where the deployments repo is cloned on the server.
+            DEPLOY_REPO="${DEPLOY_REPO:-$HOME/traeffic-setup}"
+            RELEASE="product-service"
+            NAMESPACE="default"
+
+            if [ ! -d "$DEPLOY_REPO" ]; then
+              echo "::error::No deployments repo at $DEPLOY_REPO - clone it there or set DEPLOY_REPO."
+              exit 1
+            fi
+
+            # Pick up any chart changes that were pushed alongside the app.
+            git -C "$DEPLOY_REPO" pull --ff-only || \
+              echo "WARNING: could not fast-forward $DEPLOY_REPO, using the checkout as is"
+
+            # The charts moved under deployments/; accept either layout.
+            CHART_DIR=""
+            for candidate in \
+              "$DEPLOY_REPO/deployments/charts/product-service" \
+              "$DEPLOY_REPO/charts/product-service"
+            do
+              if [ -d "$candidate" ]; then
+                CHART_DIR="$candidate"
+                break
+              fi
+            done
+
+            if [ -z "$CHART_DIR" ]; then
+              echo "::error::No product-service chart under $DEPLOY_REPO"
+              exit 1
+            fi
+
+            echo "Using chart at $CHART_DIR"
+
+            echo "Upgrading $RELEASE to $IMAGE_TAG"
+
+            helm upgrade --install "$RELEASE" "$CHART_DIR" \
+              --namespace "$NAMESPACE" \
+              --set image.tag="$IMAGE_TAG" \
+              --set gitCommit="$GITHUB_SHA" \
+              --wait --timeout 5m
+
+            kubectl -n "$NAMESPACE" rollout status "deploy/$RELEASE" --timeout=2m
+            kubectl -n "$NAMESPACE" get pods -l "app=$RELEASE"
