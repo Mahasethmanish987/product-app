@@ -13,9 +13,26 @@ from fastapi.responses import JSONResponse
 
 from errors import ServiceError
 from logging_config import SERVICE_NAME, logger, safe_extra
+from metrics import DOMAIN_ERRORS, REQUESTS_IN_PROGRESS, record_request
 from routers import categories, inventory, orders, products, reviews, stats, system
 
 REQUEST_ID_HEADER = "X-Request-ID"
+METRICS_PATH = "/metrics"
+
+
+def metrics_path_label(request, response_status):
+    """The route template a request matched, e.g. `/products/{product_id}`.
+
+    Labelling with `request.url.path` would mint a new time series for
+    every product id, and a port scanner hitting random urls could mint
+    thousands more. Unmatched requests all collapse into one label.
+    """
+    route = request.scope.get("route")
+    path = getattr(route, "path", None)
+
+    if path:
+        return path
+    return "__unmatched__" if response_status == 404 else request.url.path
 
 
 @asynccontextmanager
@@ -39,9 +56,28 @@ async def request_context(request: Request, call_next):
     request_id = request.headers.get(REQUEST_ID_HEADER) or uuid.uuid4().hex
     request.state.request_id = request_id
 
+    # Scrapes would otherwise dominate the request rate of a quiet service.
+    observed = request.url.path != METRICS_PATH
+    in_progress = REQUESTS_IN_PROGRESS.labels(method=request.method)
+
     started = time.perf_counter()
-    response = await call_next(request)
-    duration_ms = round((time.perf_counter() - started) * 1000, 2)
+    if observed:
+        in_progress.inc()
+    try:
+        response = await call_next(request)
+    finally:
+        if observed:
+            in_progress.dec()
+    duration = time.perf_counter() - started
+    duration_ms = round(duration * 1000, 2)
+
+    if observed:
+        record_request(
+            request.method,
+            metrics_path_label(request, response.status_code),
+            response.status_code,
+            duration,
+        )
 
     response.headers[REQUEST_ID_HEADER] = request_id
     response.headers["X-Response-Time-ms"] = str(duration_ms)
@@ -62,6 +98,8 @@ async def request_context(request: Request, call_next):
 @app.exception_handler(ServiceError)
 async def service_error_handler(request: Request, exc: ServiceError):
     """Every domain error renders through here, so the body shape is uniform."""
+    DOMAIN_ERRORS.labels(code=exc.code).inc()
+
     logger.warning(
         "Request rejected",
         extra=safe_extra({
@@ -81,6 +119,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     `ctx` can hold the original exception object, which json cannot encode,
     so each entry is reduced to the parts a client can act on.
     """
+    DOMAIN_ERRORS.labels(code="validation_error").inc()
+
     errors = [
         {
             "location": list(error["loc"]),

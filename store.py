@@ -13,6 +13,13 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from errors import ConflictError, InsufficientStockError, NotFoundError
+from metrics import (
+    ORDER_TRANSITIONS,
+    ORDER_VALUE,
+    ORDERS_PLACED,
+    REVIEWS_ADDED,
+    record_stock_movement,
+)
 from schemas import OrderStatus, ProductStatus, StockMovementReason
 
 DEFAULT_LOW_STOCK_THRESHOLD = 5
@@ -395,6 +402,7 @@ class Store:
             "created_at": _now(),
         }
         self._movements[movement["id"]] = movement
+        record_stock_movement(movement["reason"], delta)
         return movement
 
     # -- reviews -----------------------------------------------------------
@@ -412,6 +420,8 @@ class Store:
                 "created_at": _now(),
             }
             self._reviews[review["id"]] = review
+
+            REVIEWS_ADDED.labels(rating=str(rating)).inc()
             return review
 
     def list_reviews(self, product_id, *, limit=20, offset=0):
@@ -484,6 +494,9 @@ class Store:
                 "updated_at": now,
             }
             self._orders[order["id"]] = order
+
+            ORDERS_PLACED.labels(currency=order["currency"]).inc()
+            ORDER_VALUE.labels(currency=order["currency"]).inc(float(total))
             return order
 
     def get_order(self, order_id):
@@ -554,6 +567,10 @@ class Store:
 
             order["status"] = new_status
             order["updated_at"] = _now()
+
+            ORDER_TRANSITIONS.labels(
+                from_status=current.value, to_status=new_status.value
+            ).inc()
             return order
 
     # -- stats -------------------------------------------------------------

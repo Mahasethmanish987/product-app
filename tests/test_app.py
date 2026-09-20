@@ -570,3 +570,187 @@ def test_low_stock_threshold_can_be_overridden(client):
     body = client.get("/stats/low-stock?threshold=20").json()
 
     assert {state["sku"] for state in body} == {"LAP-001", "KEY-001"}
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+#
+# Counters are process-global and never reset between tests, so these assert
+# on a *delta* around the action rather than an absolute value.
+# ---------------------------------------------------------------------------
+
+def sample(body, name, **labels):
+    """Pull one sample out of the exposition text, or None if absent."""
+    if labels:
+        rendered = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+        prefix = f"product_service_{name}{{{rendered}}} "
+    else:
+        prefix = f"product_service_{name} "
+
+    for line in body.splitlines():
+        if line.startswith(prefix):
+            return float(line[len(prefix):])
+    return None
+
+
+def test_metrics_endpoint_serves_prometheus_text(client):
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "product_service_products " in response.text
+
+
+def test_metrics_is_not_in_the_public_openapi_schema(client):
+    schema = client.get("/openapi.json").json()
+
+    assert "/metrics" not in schema["paths"]
+
+
+def test_store_gauges_read_live_catalogue_state(client, new_product):
+    before = sample(client.get("/metrics").text, "products")
+
+    new_product(sku="GAUGE-1")
+
+    assert sample(client.get("/metrics").text, "products") == before + 1
+
+
+def test_gauges_track_the_seeded_catalogue(client):
+    body = client.get("/metrics").text
+
+    assert sample(body, "products") == 2
+    assert sample(body, "categories") == 2
+    assert sample(body, "stock_units") == 15
+    assert sample(body, "inventory_value") == 15857.97
+    assert sample(body, "category_stock_units", category="Electronics") == 12
+
+
+def test_average_rating_has_no_series_until_something_is_reviewed(client):
+    """A 0 here would read as "everyone hates us"; the series must be absent."""
+    assert sample(client.get("/metrics").text, "average_rating") is None
+
+    client.post("/products/1/reviews", json={"author": "ana", "rating": 4})
+
+    assert sample(client.get("/metrics").text, "average_rating") == 4.0
+
+
+def test_requests_are_labelled_with_the_route_template(client):
+    client.get("/products/1")
+
+    body = client.get("/metrics").text
+    assert sample(
+        body, "http_requests_total",
+        method="GET", path="/products/{product_id}", status="200",
+    ) is not None
+
+
+def test_unmatched_paths_collapse_into_one_series(client):
+    client.get("/nope/not/here")
+
+    body = client.get("/metrics").text
+    assert sample(
+        body, "http_requests_total", method="GET", path="__unmatched__", status="404",
+    ) is not None
+    # The raw path must never become a label, or a scanner mints series at will.
+    assert "/nope/not/here" not in body
+
+
+def test_scraping_does_not_count_itself_as_traffic(client):
+    client.get("/metrics")
+    body = client.get("/metrics").text
+
+    assert sample(body, "http_requests_total", method="GET", path="/metrics", status="200") is None
+
+
+def test_placing_an_order_bumps_the_business_counters(client, new_product):
+    product = new_product(sku="ORD-1", initial_stock=10, price="10.00")
+
+    before_orders = sample(client.get("/metrics").text, "orders_placed_total", currency="USD") or 0
+    before_value = sample(client.get("/metrics").text, "order_value_total", currency="USD") or 0
+
+    client.post("/orders", json={
+        "customer": "acme",
+        "lines": [{"product_id": product["id"], "quantity": 3}],
+    })
+
+    body = client.get("/metrics").text
+    assert sample(body, "orders_placed_total", currency="USD") == before_orders + 1
+    assert sample(body, "order_value_total", currency="USD") == before_value + 30.0
+
+
+def test_paying_an_order_records_the_transition_and_the_sale(client, new_product):
+    product = new_product(sku="ORD-2", initial_stock=10)
+    order = client.post("/orders", json={
+        "customer": "acme",
+        "lines": [{"product_id": product["id"], "quantity": 2}],
+    }).json()
+
+    before = sample(
+        client.get("/metrics").text,
+        "order_transitions_total", from_status="pending", to_status="paid",
+    ) or 0
+    before_sold = sample(
+        client.get("/metrics").text,
+        "stock_units_moved_total", direction="out", reason="sale",
+    ) or 0
+
+    client.post(f"/orders/{order['id']}/pay")
+
+    body = client.get("/metrics").text
+    assert sample(
+        body, "order_transitions_total", from_status="pending", to_status="paid",
+    ) == before + 1
+    # The sale movement is written inside the store, not by the router -- this
+    # is what proves the counter sits at the real choke point.
+    assert sample(
+        body, "stock_units_moved_total", direction="out", reason="sale",
+    ) == before_sold + 2
+
+
+def test_rejected_requests_are_counted_by_error_code(client):
+    before = sample(client.get("/metrics").text, "domain_errors_total", code="not_found") or 0
+
+    client.get("/products/999999")
+
+    assert sample(
+        client.get("/metrics").text, "domain_errors_total", code="not_found",
+    ) == before + 1
+
+
+def test_validation_failures_are_counted_too(client):
+    before = sample(
+        client.get("/metrics").text, "domain_errors_total", code="validation_error",
+    ) or 0
+
+    client.post("/products", json={"name": ""})
+
+    assert sample(
+        client.get("/metrics").text, "domain_errors_total", code="validation_error",
+    ) == before + 1
+
+
+def test_orders_gauge_splits_by_status(client, new_product):
+    product = new_product(sku="ORD-3", initial_stock=10)
+    client.post("/orders", json={
+        "customer": "acme",
+        "lines": [{"product_id": product["id"], "quantity": 1}],
+    })
+
+    body = client.get("/metrics").text
+    assert sample(body, "orders", status="pending") == 1
+    assert sample(body, "orders", status="paid") == 0
+
+
+def test_a_failing_store_does_not_break_the_whole_endpoint(client, monkeypatch):
+    """One bad gauge must not take the HTTP and business metrics with it."""
+    import store as store_module
+
+    monkeypatch.setattr(
+        store_module.store, "overview",
+        lambda: (_ for _ in ()).throw(RuntimeError("store is down")),
+    )
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert "product_service_http_requests_total" in response.text

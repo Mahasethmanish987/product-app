@@ -20,7 +20,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # The service is a package now, not a single file.
-COPY app.py errors.py logging_config.py schemas.py store.py ./
+COPY app.py errors.py logging_config.py metrics.py schemas.py store.py ./
 COPY routers ./routers
 
 # Run unprivileged; the chart's securityContext pins the same uid.
@@ -30,4 +30,7 @@ USER 10001
 
 EXPOSE 8000
 
+# One worker process, so prometheus_client's default in-process registry is
+# the whole story. Adding --workers means adding multiprocess mode too, or
+# each scrape hits a random worker and the counters jump around.
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
